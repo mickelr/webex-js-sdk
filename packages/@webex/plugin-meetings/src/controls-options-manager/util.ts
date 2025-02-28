@@ -302,6 +302,8 @@ class Utils {
         break;
 
       case Control.viewTheParticipantListForWebinar:
+        // Cantina checks whether it can update view the participant list for webinar according to meeting actions
+        // So we skip the check here
         determinant = true;
         break;
 

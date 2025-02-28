@@ -506,6 +506,19 @@ describe('plugin-meetings', () => {
           assert.isTrue(results);
         });
 
+        it('should skip the check if the scope is viewTheParticipantListForWebinar', () => {
+          const control = {scope: 'viewTheParticipantListForWebinar'};
+
+          const results = ControlsOptionsUtil.canUpdate(control, displayHints);
+
+          assert.callCount(ControlsOptionsUtil.canUpdateAudio, 0);
+          assert.callCount(ControlsOptionsUtil.canUpdateRaiseHand, 0);
+          assert.callCount(ControlsOptionsUtil.canUpdateReactions, 0);
+          assert.callCount(ControlsOptionsUtil.canUpdateShareControl, 0);
+          assert.callCount(ControlsOptionsUtil.canUpdateVideo, 0);
+          assert.isTrue(results);
+        });
+
         it('should return false when the provided control scope is not supported', () => {
           const control = {scope: 'invalid'};
 
