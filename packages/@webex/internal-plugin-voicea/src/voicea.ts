@@ -58,6 +58,7 @@ export class VoiceaChannel extends WebexPlugin implements IVoiceaChannel {
         this.processTranscription(e.data.voiceaPayload);
         break;
       case AIBRIDGE_RELAY_TYPES.MANUAL.TRANSCRIPTION:
+      case AIBRIDGE_RELAY_TYPES.MANUAL.CAPIONER:
         this.processManualTranscription(e.data.transcriptPayload);
         break;
       default:
@@ -112,7 +113,7 @@ export class VoiceaChannel extends WebexPlugin implements IVoiceaChannel {
   private processManualTranscription = (transcriptPayload: TranscriptionResponse): void => {
     switch (transcriptPayload.type) {
       case TRANSCRIPTION_TYPE.MANUAL_CAPTION_FINAL_RESULT:
-      case TRANSCRIPTION_TYPE.MANUAL_CAPTION_INTERIM_RESULTS:
+      case TRANSCRIPTION_TYPE.MANUAL_CAPTION_INTERIM_RESULT:
         // @ts-ignore
         this.trigger(EVENT_TRIGGERS.NEW_MANUAL_CAPTION, {
           isFinal: transcriptPayload.type === TRANSCRIPTION_TYPE.MANUAL_CAPTION_FINAL_RESULT,
