@@ -59,7 +59,11 @@ export class VoiceaChannel extends WebexPlugin implements IVoiceaChannel {
         break;
       case AIBRIDGE_RELAY_TYPES.MANUAL.TRANSCRIPTION:
       case AIBRIDGE_RELAY_TYPES.MANUAL.CAPIONER:
-        this.processManualTranscription(e.data.transcriptPayload);
+        this.processManualTranscription({
+          ...e.data.transcriptPayload,
+          sender: e.headers?.from,
+          data_source: e.data.relayType,
+        });
         break;
       default:
         break;
@@ -111,19 +115,18 @@ export class VoiceaChannel extends WebexPlugin implements IVoiceaChannel {
    * @returns {void}
    */
   private processManualTranscription = (transcriptPayload: TranscriptionResponse): void => {
-    switch (transcriptPayload.type) {
-      case TRANSCRIPTION_TYPE.MANUAL_CAPTION_FINAL_RESULT:
-      case TRANSCRIPTION_TYPE.MANUAL_CAPTION_INTERIM_RESULT:
-        // @ts-ignore
-        this.trigger(EVENT_TRIGGERS.NEW_MANUAL_CAPTION, {
-          isFinal: transcriptPayload.type === TRANSCRIPTION_TYPE.MANUAL_CAPTION_FINAL_RESULT,
-          transcriptId: transcriptPayload.id,
-          transcripts: transcriptPayload.transcripts,
-        });
-        break;
-
-      default:
-        break;
+    if (
+      transcriptPayload.type === TRANSCRIPTION_TYPE.MANUAL_CAPTION_FINAL_RESULT ||
+      transcriptPayload.type === TRANSCRIPTION_TYPE.MANUAL_CAPTION_INTERIM_RESULT
+    ) {
+      // @ts-ignore
+      this.trigger(EVENT_TRIGGERS.NEW_MANUAL_CAPTION, {
+        isFinal: transcriptPayload.type === TRANSCRIPTION_TYPE.MANUAL_CAPTION_FINAL_RESULT,
+        transcriptId: transcriptPayload.id,
+        transcripts: transcriptPayload.transcripts,
+        sender: transcriptPayload.sender,
+        source: transcriptPayload.data_source,
+      });
     }
   };
 
