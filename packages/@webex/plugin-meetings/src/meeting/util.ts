@@ -393,11 +393,7 @@ const MeetingUtil = {
       })
       .then(() => meeting.stopKeepAlive())
       .then(() => {
-        if (meeting.config?.enableAutomaticLLM) {
-          return meeting.cleanupLLMConneciton({throwOnError: false});
-        }
-
-        return undefined;
+        return meeting.clearMeetingData();
       });
   },
 
