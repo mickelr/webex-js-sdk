@@ -3206,13 +3206,20 @@ export default class Meeting extends StatelessWebexPlugin {
           newShareStatus = SHARE_STATUS.WHITEBOARD_SHARE_ACTIVE;
         }
       }
-      // or if content share is either released or null and whiteboard share is either released or null, no one is sharing
+      // Preserve local sharing while another participant's content floor is only ACCEPTED.
+      // The final GRANTED update must still see oldShareStatus as LOCAL_SHARE_ACTIVE so
+      // steal handling can unpublish our local share streams.
       else if (
-        ((previousContentShare && contentShare.disposition === FLOOR_ACTION.RELEASED) ||
-          contentShare.disposition === null) &&
-        ((previousWhiteboardShare && whiteboardShare.disposition === FLOOR_ACTION.RELEASED) ||
-          whiteboardShare.disposition === null)
+        this.shareStatus === SHARE_STATUS.LOCAL_SHARE_ACTIVE &&
+        contentShare.disposition === FLOOR_ACTION.ACCEPTED
       ) {
+        newShareStatus = SHARE_STATUS.LOCAL_SHARE_ACTIVE;
+      }
+      // Otherwise, neither content nor whiteboard floor is GRANTED (covers
+      // RELEASED, null, and intermediate dispositions such as ACCEPTED), so no
+      // one is currently sharing. Local active content shares are preserved above
+      // until another participant receives the final GRANTED floor update.
+      else {
         newShareStatus = SHARE_STATUS.NO_SHARE;
       }
 
