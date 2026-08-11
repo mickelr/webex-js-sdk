@@ -317,6 +317,7 @@ const MeetingUtil = {
         locale: options.locale,
         deviceCapabilities: options.deviceCapabilities,
         liveAnnotationSupported: options.liveAnnotationSupported,
+        enableSimultaneousInterpretation: options.enableSimultaneousInterpretation,
         clientMediaPreferences,
         alias: options.alias,
       })
@@ -919,9 +920,20 @@ const MeetingUtil = {
 
       const options = buildLocusDeltaRequestOptions(originalOptions);
 
-      return meeting
-        .request(options)
-        .then((response) => MeetingUtil.updateLocusFromApiResponse(meeting, response));
+      return meeting.request(options).then((response) => {
+        const requestUri = options?.uri;
+        const meetingLocusUrl = meeting.locusUrl;
+
+        if (!requestUri || !meetingLocusUrl || !requestUri.startsWith(meetingLocusUrl)) {
+          LoggerProxy.logger.info(
+            `Meeting:util#generateLocusDeltaRequest --> skipping updateLocusFromApiResponse, request uri "${requestUri}" does not match meeting locusUrl "${meetingLocusUrl}"`
+          );
+
+          return response;
+        }
+
+        return MeetingUtil.updateLocusFromApiResponse(meeting, response);
+      });
     };
 
     return locusDeltaRequest;
@@ -947,6 +959,18 @@ const MeetingUtil = {
 
   isAnonymizeDisplayNamesEnabled: (displayHints) =>
     displayHints.includes(DISPLAY_HINTS.ANONYMOUS_DISPLAY_NAMES_ENABLED),
+
+  canViewTheParticipantList: (displayHints, canNotViewTheParticipantList: boolean) => {
+    if (!displayHints.includes(DISPLAY_HINTS.VIEW_THE_PARTICIPANT_LIST)) {
+      return false;
+    }
+
+    if (canNotViewTheParticipantList) {
+      return false;
+    }
+
+    return displayHints.includes(DISPLAY_HINTS.CAN_VIEW_THE_PARTICIPANT_LIST);
+  },
 
   selfSupportsFeature: (feature: SELF_POLICY, userPolicies: Record<SELF_POLICY, boolean>) => {
     if (!userPolicies) {

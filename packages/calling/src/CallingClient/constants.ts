@@ -130,6 +130,8 @@ export const MOBIUS_EU_INT = 'mobius-eu-central-1.int.infra.webex.com';
 export const FAILOVER_CACHE_PREFIX = 'wxc-failover-state';
 export const ACTIVE_MOBIUS_STORAGE_KEY = 'wxc-active-mobius';
 export const ICE_CANDIDATES_TIMEOUT = 3000;
+// Reduced ICE candidates timeout used for ice-lite offers.
+export const ICE_LITE_CANDIDATES_TIMEOUT = 500;
 export const WCC_CALLING_RTMS_DOMAIN = 'wcc-calling-rtms-domain';
 
 // Define constants for method names
@@ -238,8 +240,11 @@ export const METHODS = {
   GET_SDK_CONNECTOR: 'getSDKConnector',
   GET_CONNECTED_CALL: 'getConnectedCall',
   CONNECT_TO_MOBIUS_SOCKET: 'connectToMobiusSocket',
+  SET_SOCKET_ENABLED: 'setSocketEnabled',
   REGISTER_MOBIUS_SOCKET_LISTENER: 'registerMobiusSocketListener',
   UNREGISTER_MOBIUS_SOCKET_LISTENER: 'unregisterMobiusSocketListener',
+  REGISTER_MOBIUS_SOCKET_CONNECTION_LISTENER: 'registerMobiusSocketConnectionListener',
+  UNREGISTER_MOBIUS_SOCKET_CONNECTION_LISTENER: 'unregisterMobiusSocketConnectionListener',
   HANDLE_MOBIUS_ASYNC_EVENT: 'handleMobiusAsyncEvent',
   HANDLE_REGISTRATION_DOWN_EVENT: 'handleRegistrationDownEvent',
   DISCONNECT_FROM_MOBIUS_SOCKET: 'disconnectFromMobiusSocket',

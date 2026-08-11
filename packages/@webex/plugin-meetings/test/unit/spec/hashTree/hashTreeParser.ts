@@ -13,6 +13,7 @@ import testUtils from '@webex/plugin-meetings/test/utils/testUtils';
 import { some } from 'lodash';
 import Metrics from '@webex/plugin-meetings/src/metrics';
 import BEHAVIORAL_METRICS from '@webex/plugin-meetings/src/metrics/constants';
+import LoggerProxy from '@webex/plugin-meetings/src/common/logs/logger-proxy';
 
 const visibleDataSetsUrl = 'https://locus-a.wbx2.com/locus/api/v1/loci/97d64a5f/visibleDataSets';
 
@@ -117,6 +118,7 @@ function createDataSet(name: string, leafCount: number, version = 1) {
     name,
     idleMs: 1000,
     backoff: {maxMs: 1000, exponent: 2},
+    heartbeatIntervalMs: 5000,
   };
 }
 
@@ -158,6 +160,7 @@ describe('HashTreeParser', () => {
   let callback: sinon.SinonStub;
   let mathRandomStub: sinon.SinonStub;
   let metricsStub: sinon.SinonStub;
+  let loggerInfoStub: sinon.SinonStub;
 
   beforeEach(() => {
     clock = sinon.useFakeTimers();
@@ -165,26 +168,36 @@ describe('HashTreeParser', () => {
     callback = sinon.stub();
     mathRandomStub = sinon.stub(Math, 'random').returns(0);
     metricsStub = sinon.stub(Metrics, 'sendBehavioralMetric');
+    loggerInfoStub = sinon.stub(LoggerProxy.logger, 'info');
   });
   afterEach(() => {
     clock.restore();
     mathRandomStub.restore();
     metricsStub.restore();
+    loggerInfoStub.restore();
   });
 
   // Helper to create a HashTreeParser instance with common defaults
   function createHashTreeParser(
     initialLocus: any = exampleInitialLocus,
     metadata: any = exampleMetadata,
-    excludedDataSets?: string[]
+    excludedDataSets?: string[],
+    syncLatencyTracker?: any,
+    syncLatencyMeetingId = 'meeting-1',
+    generateTrackingId?: any
   ) {
     return new HashTreeParser({
       initialLocus,
       metadata,
       webexRequest,
-      locusInfoUpdateCallback: callback,
+      callbacks: {
+        locusInfoUpdateCallback: callback,
+        syncLatencyTracker,
+        generateTrackingId,
+      },
       debugId: 'test',
       excludedDataSets,
+      syncLatencyMeetingId,
     });
   }
 
@@ -225,7 +238,7 @@ describe('HashTreeParser', () => {
   }
 
   // Helper to mock sendSyncRequestToLocus response
-  function mockSendSyncRequestResponse(dataSetUrl: string, response: any) {
+  function mockSendSyncRequestResponse(dataSetUrl: string, response: any, headers?: any) {
     webexRequest
       .withArgs(
         sinon.match({
@@ -235,6 +248,7 @@ describe('HashTreeParser', () => {
       )
       .resolves({
         body: response,
+        headers,
       });
   }
 
@@ -1771,6 +1785,118 @@ describe('HashTreeParser', () => {
         });
       });
 
+      it('filters a "main" sync response down to the requested dataset, ignoring shared datasets like "unjoined"', async () => {
+        // Set up a parser where both "main" and "unjoined" are visible and share the core locus
+        // element (they always advance to the same version on the server).
+        const sharedInitialLocus = {
+          dataSets: [createDataSet('main', 16, 1000), createDataSet('unjoined', 16, 1000)],
+          locus: {
+            url: locusUrl,
+            htMeta: {
+              elementId: {type: 'locus', id: 0, version: 200},
+              dataSetNames: ['main', 'unjoined'],
+            },
+            links: {resources: {visibleDataSets: {url: visibleDataSetsUrl}}},
+            participants: [],
+          },
+        };
+        const sharedMetadata = {
+          htMeta: {elementId: {type: 'metadata', id: 5, version: 50}, dataSetNames: ['self']},
+          visibleDataSets: [
+            {name: 'main', url: `${locusUrl}/datasets/main`},
+            {name: 'unjoined', url: `${locusUrl}/datasets/unjoined`},
+          ],
+        };
+
+        const parser = createHashTreeParser(sharedInitialLocus, sharedMetadata);
+
+        // both datasets have their own hash tree, sharing the locus element
+        assert.exists(parser.dataSets.main.hashTree);
+        assert.exists(parser.dataSets.unjoined.hashTree);
+
+        // start the sync timer with a normal "main" message (mismatched root hash)
+        const message = {
+          dataSets: [{...createDataSet('main', 16, 1100), root: 'a'.repeat(32)}],
+          visibleDataSetsUrl,
+          locusUrl,
+          locusStateElements: [
+            {
+              htMeta: {
+                elementId: {type: 'locus' as const, id: 0, version: 201},
+                dataSetNames: ['main'],
+              },
+              data: {info: {id: 'initial-update'}},
+            },
+          ],
+        };
+        parser.handleMessage(message, 'initial message');
+        assert.calledOnce(callback);
+        callback.resetHistory();
+
+        const mainDataSetUrl = parser.dataSets.main.url;
+
+        mockGetHashesFromLocusResponse(
+          mainDataSetUrl,
+          new Array(16).fill('0'.repeat(32)),
+          createDataSet('main', 16, 1101)
+        );
+
+        // The sync response for "main" also carries the "unjoined" dataset, the shared locus
+        // element tagged with both datasets, and an "unjoined"-only element - all of which must
+        // be filtered out so that only the requested "main" data is processed.
+        const mainSyncDataSet = createDataSet('main', 16, 1101);
+        mainSyncDataSet.root = parser.dataSets.main.hashTree.getRootHash();
+        mockSendSyncRequestResponse(mainDataSetUrl, {
+          dataSets: [mainSyncDataSet, createDataSet('unjoined', 16, 1101)],
+          visibleDataSetsUrl,
+          locusUrl,
+          locusStateElements: [
+            {
+              htMeta: {
+                elementId: {type: 'locus' as const, id: 0, version: 202},
+                dataSetNames: ['main', 'unjoined'],
+              },
+              data: {info: {id: 'synced-shared-locus'}},
+            },
+            {
+              htMeta: {
+                elementId: {type: 'participant' as const, id: 99, version: 500},
+                dataSetNames: ['unjoined'],
+              },
+              data: {person: {name: 'unjoined-only'}},
+            },
+          ],
+        });
+
+        await clock.tickAsync(1000);
+
+        // the "unjoined" dataset info must NOT be updated from a "main" sync response
+        expect(parser.dataSets.unjoined.version).to.equal(1000);
+
+        // the shared locus element is reported exactly once (not once per dataset), and the
+        // "unjoined"-only element is not reported at all
+        assert.calledOnceWithExactly(callback, {
+          updateType: LocusInfoUpdateType.OBJECTS_UPDATED,
+          updatedObjects: [
+            {
+              htMeta: {
+                elementId: {type: 'locus', id: 0, version: 202},
+                dataSetNames: ['main', 'unjoined'],
+              },
+              data: {info: {id: 'synced-shared-locus'}},
+            },
+          ],
+        });
+
+        // the filtered-out dataset and element are logged
+        assert.calledWith(
+          loggerInfoStub,
+          sinon.match(
+            'keeping only dataset "main", filtering out datasets: [unjoined:1101], elements: [participant:99:500]'
+          )
+        );
+      });
+
       describe('emits MEETING_ENDED when 409/2403004 is returned', () => {
           it('when /hashtree returns 409', async () => {
             const parser = createHashTreeParser();
@@ -2383,6 +2509,7 @@ describe('HashTreeParser', () => {
           reason: 'sync failed',
         });
       });
+
     });
 
     describe('handles visible data sets changes correctly', () => {
@@ -3042,7 +3169,6 @@ describe('HashTreeParser', () => {
           ],
           visibleDataSetsUrl,
           locusUrl,
-          heartbeatIntervalMs,
         };
 
         parser.handleMessage(heartbeatMessage, 'initial heartbeat');
@@ -3097,6 +3223,106 @@ describe('HashTreeParser', () => {
         );
       });
 
+      it('uses the watchdog random backoff when reporting sync metrics', async () => {
+        const syncLatencyTracker = {
+          saveLatency: sinon.stub(),
+          saveTimestamp: sinon.stub(),
+          getLocusSyncLatency: sinon.stub(),
+          clearLocusSyncLatency: sinon.stub(),
+          completeLocusSyncLatency: sinon.stub(),
+        };
+        const parser = createHashTreeParser(
+          undefined,
+          undefined,
+          undefined,
+          syncLatencyTracker
+        );
+        const heartbeatIntervalMs = 5000;
+        const mainDataSetUrl = parser.dataSets.main.url;
+
+        mathRandomStub.onFirstCall().returns(0.1); // root-hash timer backoff = 10ms
+        mathRandomStub.onSecondCall().returns(0.5); // watchdog backoff = 250ms
+        mathRandomStub.returns(0);
+
+        parser.handleMessage(
+          {
+            dataSets: [
+              {
+                ...createDataSet('main', 16, 1100),
+                root: parser.dataSets.main.hashTree.getRootHash(),
+              },
+            ],
+            visibleDataSetsUrl,
+            locusUrl,
+          },
+          'initial heartbeat'
+        );
+
+        mockGetHashesFromLocusResponse(
+          mainDataSetUrl,
+          new Array(16).fill('00000000000000000000000000000000'),
+          createDataSet('main', 16, 1101)
+        );
+        mockSendSyncRequestResponse(mainDataSetUrl, null);
+
+        await clock.tickAsync(heartbeatIntervalMs + 250);
+
+        assert.calledWithExactly(
+          syncLatencyTracker.saveLatency,
+          'internal.client.locus.sync.random.backoff',
+          250,
+          {
+            meetingId: 'meeting-1',
+            dataSetName: 'main',
+          }
+        );
+      });
+
+      it('uses the root sync random backoff when root timer fires before watchdog', async () => {
+        const syncLatencyTracker = {
+          saveLatency: sinon.stub(),
+          saveTimestamp: sinon.stub(),
+          getLocusSyncLatency: sinon.stub(),
+          clearLocusSyncLatency: sinon.stub(),
+          completeLocusSyncLatency: sinon.stub(),
+        };
+        const parser = createHashTreeParser(
+          undefined,
+          undefined,
+          undefined,
+          syncLatencyTracker
+        );
+        const mainDataSetUrl = parser.dataSets.main.url;
+
+        mathRandomStub.onFirstCall().returns(0.1); // root-hash timer backoff = 10ms
+        mathRandomStub.onSecondCall().returns(0.5); // watchdog backoff = 250ms
+        mathRandomStub.returns(0);
+
+        parser.handleMessage(
+          createHeartbeatMessage('main', 16, 1100, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1'),
+          'root mismatch heartbeat'
+        );
+
+        mockGetHashesFromLocusResponse(
+          mainDataSetUrl,
+          new Array(16).fill('00000000000000000000000000000000'),
+          createDataSet('main', 16, 1101)
+        );
+        mockSendSyncRequestResponse(mainDataSetUrl, null);
+
+        await clock.tickAsync(1010);
+
+        assert.calledWithExactly(
+          syncLatencyTracker.saveLatency,
+          'internal.client.locus.sync.random.backoff',
+          10,
+          {
+            meetingId: 'meeting-1',
+            dataSetName: 'main',
+          }
+        );
+      });
+
       it('calls POST sync directly for leafCount === 1 data sets', async () => {
         const parser = createHashTreeParser();
         const heartbeatIntervalMs = 5000;
@@ -3112,7 +3338,6 @@ describe('HashTreeParser', () => {
           ],
           visibleDataSetsUrl,
           locusUrl,
-          heartbeatIntervalMs,
         };
 
         parser.handleMessage(heartbeatMessage, 'self heartbeat');
@@ -3148,7 +3373,6 @@ describe('HashTreeParser', () => {
 
       it('sets watchdog timers for each data set in the message', async () => {
         const parser = createHashTreeParser();
-        const heartbeatIntervalMs = 5000;
 
         // Send heartbeat with multiple datasets
         const heartbeatMessage = {
@@ -3165,7 +3389,6 @@ describe('HashTreeParser', () => {
           ],
           visibleDataSetsUrl,
           locusUrl,
-          heartbeatIntervalMs,
         };
 
         parser.handleMessage(heartbeatMessage, 'multi-dataset heartbeat');
@@ -3179,7 +3402,6 @@ describe('HashTreeParser', () => {
 
       it('resets the watchdog timer for a specific data set when a new heartbeat for it is received', async () => {
         const parser = createHashTreeParser();
-        const heartbeatIntervalMs = 5000;
 
         // Send first heartbeat for 'main'
         const heartbeat1 = {
@@ -3191,7 +3413,6 @@ describe('HashTreeParser', () => {
           ],
           visibleDataSetsUrl,
           locusUrl,
-          heartbeatIntervalMs,
         };
 
         parser.handleMessage(heartbeat1, 'first heartbeat');
@@ -3212,7 +3433,6 @@ describe('HashTreeParser', () => {
           ],
           visibleDataSetsUrl,
           locusUrl,
-          heartbeatIntervalMs,
         };
 
         parser.handleMessage(heartbeat2, 'second heartbeat');
@@ -3231,7 +3451,6 @@ describe('HashTreeParser', () => {
 
       it('resets the watchdog timer when a normal message (with locusStateElements) is received', async () => {
         const parser = createHashTreeParser();
-        const heartbeatIntervalMs = 5000;
 
         // Send initial heartbeat to start the watchdog for 'main'
         const heartbeat = {
@@ -3243,7 +3462,6 @@ describe('HashTreeParser', () => {
           ],
           visibleDataSetsUrl,
           locusUrl,
-          heartbeatIntervalMs,
         };
 
         parser.handleMessage(heartbeat, 'initial heartbeat');
@@ -3271,7 +3489,6 @@ describe('HashTreeParser', () => {
               data: {someData: 'value'},
             },
           ],
-          heartbeatIntervalMs,
         };
 
         parser.handleMessage(normalMessage, 'normal message');
@@ -3285,12 +3502,17 @@ describe('HashTreeParser', () => {
         const parser = createHashTreeParser();
 
         // Send a heartbeat message without heartbeatIntervalMs
-        const heartbeatMessage = createHeartbeatMessage(
-          'main',
-          16,
-          1100,
-          parser.dataSets.main.hashTree.getRootHash()
-        );
+        const heartbeatMessage = {
+          dataSets: [
+            {
+              ...createDataSet('main', 16, 1100),
+              root: parser.dataSets.main.hashTree.getRootHash(),
+              heartbeatIntervalMs: undefined,
+            },
+          ],
+          visibleDataSetsUrl,
+          locusUrl,
+        };
 
         parser.handleMessage(heartbeatMessage, 'heartbeat without interval');
 
@@ -3299,7 +3521,6 @@ describe('HashTreeParser', () => {
 
       it('stops all watchdog timers when meeting ends via sentinel message', async () => {
         const parser = createHashTreeParser();
-        const heartbeatIntervalMs = 5000;
 
         // Send heartbeat for multiple datasets
         const heartbeat = {
@@ -3316,7 +3537,6 @@ describe('HashTreeParser', () => {
           ],
           visibleDataSetsUrl,
           locusUrl,
-          heartbeatIntervalMs,
         };
 
         parser.handleMessage(heartbeat, 'initial heartbeat');
@@ -3367,7 +3587,6 @@ describe('HashTreeParser', () => {
         };
 
         const parser = createHashTreeParser(initialLocus, metadata);
-        const heartbeatIntervalMs = 5000;
 
         // Set Math.random to return 1 so that backoff = 1^exponent * maxMs = maxMs
         mathRandomStub.returns(1);
@@ -3389,7 +3608,6 @@ describe('HashTreeParser', () => {
           ],
           visibleDataSetsUrl,
           locusUrl,
-          heartbeatIntervalMs,
         };
 
         parser.handleMessage(heartbeat, 'heartbeat');
@@ -3439,7 +3657,6 @@ describe('HashTreeParser', () => {
 
       it('does not set watchdog for data sets without a hash tree', async () => {
         const parser = createHashTreeParser();
-        const heartbeatIntervalMs = 5000;
 
         // 'atd-active' is in the initial locus but is not visible (no hash tree)
         // Send heartbeat mentioning a non-visible dataset
@@ -3453,7 +3670,6 @@ describe('HashTreeParser', () => {
           ],
           visibleDataSetsUrl,
           locusUrl,
-          heartbeatIntervalMs,
         };
 
         parser.handleMessage(heartbeatMessage, 'heartbeat with non-visible dataset');
@@ -3477,7 +3693,6 @@ describe('HashTreeParser', () => {
           ],
           visibleDataSetsUrl,
           locusUrl,
-          heartbeatIntervalMs,
         };
 
         parser.handleMessage(heartbeatMessage, 'initial heartbeat');
@@ -3530,6 +3745,122 @@ describe('HashTreeParser', () => {
 
         // And the watchdog should still be running
         expect(parser.dataSets.main.heartbeatWatchdogTimer).to.not.be.undefined;
+      });
+
+      it('uses dataset-level heartbeatIntervalMs over top-level value', async () => {
+        const parser = createHashTreeParser();
+        const datasetLevelInterval = 3000;
+        const topLevelInterval = 8000;
+
+        // Send heartbeat with both top-level and dataset-level heartbeatIntervalMs
+        const heartbeatMessage = {
+          dataSets: [
+            {
+              ...createDataSet('main', 16, 1100),
+              root: parser.dataSets.main.hashTree.getRootHash(),
+              heartbeatIntervalMs: datasetLevelInterval,
+            },
+          ],
+          visibleDataSetsUrl,
+          locusUrl,
+          heartbeatIntervalMs: topLevelInterval,
+        };
+
+        parser.handleMessage(heartbeatMessage, 'heartbeat with both levels');
+
+        expect(parser.dataSets.main.heartbeatWatchdogTimer).to.not.be.undefined;
+
+        // Mock sync responses
+        const mainDataSetUrl = parser.dataSets.main.url;
+        mockGetHashesFromLocusResponse(
+          mainDataSetUrl,
+          new Array(16).fill('00000000000000000000000000000000'),
+          createDataSet('main', 16, 1101)
+        );
+        mockSendSyncRequestResponse(mainDataSetUrl, null);
+
+        // Watchdog should NOT fire at the top-level interval (8000ms)
+        // It should fire at the dataset-level interval (3000ms)
+        await clock.tickAsync(datasetLevelInterval - 1);
+        assert.notCalled(webexRequest);
+
+        await clock.tickAsync(1);
+        // Now at datasetLevelInterval, watchdog should have fired
+        assert.calledWith(
+          webexRequest,
+          sinon.match({
+            method: 'GET',
+            uri: `${mainDataSetUrl}/hashtree`,
+          })
+        );
+      });
+
+      it('falls back to top-level heartbeatIntervalMs when dataset-level is missing', async () => {
+        const parser = createHashTreeParser();
+        const topLevelInterval = 7000;
+
+        // Send heartbeat with top-level heartbeatIntervalMs but no dataset-level
+        const heartbeatMessage = {
+          dataSets: [
+            {
+              ...createDataSet('main', 16, 1100),
+              root: parser.dataSets.main.hashTree.getRootHash(),
+              heartbeatIntervalMs: undefined,
+            },
+          ],
+          visibleDataSetsUrl,
+          locusUrl,
+          heartbeatIntervalMs: topLevelInterval,
+        };
+
+        parser.handleMessage(heartbeatMessage, 'heartbeat with top-level only');
+
+        expect(parser.dataSets.main.heartbeatWatchdogTimer).to.not.be.undefined;
+
+        // Mock sync responses
+        const mainDataSetUrl = parser.dataSets.main.url;
+        mockGetHashesFromLocusResponse(
+          mainDataSetUrl,
+          new Array(16).fill('00000000000000000000000000000000'),
+          createDataSet('main', 16, 1101)
+        );
+        mockSendSyncRequestResponse(mainDataSetUrl, null);
+
+        // Should fire at the top-level interval
+        await clock.tickAsync(topLevelInterval - 1);
+        assert.notCalled(webexRequest);
+
+        await clock.tickAsync(1);
+        assert.calledWith(
+          webexRequest,
+          sinon.match({
+            method: 'GET',
+            uri: `${mainDataSetUrl}/hashtree`,
+          })
+        );
+      });
+
+      it('does not start watchdog when dataset-level heartbeatIntervalMs is 0 even if top-level is set', async () => {
+        const parser = createHashTreeParser();
+
+        // Send heartbeat with dataset-level 0 and a top-level value
+        const heartbeatMessage = {
+          dataSets: [
+            {
+              ...createDataSet('main', 16, 1100),
+              root: parser.dataSets.main.hashTree.getRootHash(),
+              heartbeatIntervalMs: 0,
+            },
+          ],
+          visibleDataSetsUrl,
+          locusUrl,
+          heartbeatIntervalMs: 5000,
+        };
+
+        parser.handleMessage(heartbeatMessage, 'heartbeat with dataset-level 0');
+
+        // Dataset-level 0 means no watchdog, should NOT fall back to top-level
+        expect(parser.dataSets.main.heartbeatWatchdogTimer).to.be.undefined;
       });
     });
 
@@ -4592,6 +4923,47 @@ describe('HashTreeParser', () => {
       assert.neverCalledWith(webexRequest, sinon.match({method: 'GET', uri: `${selfUrl}/hashtree`}));
     });
 
+    it('uses the syncAll random backoff when reporting sync metrics', async () => {
+      mathRandomStub.returns(0.5); // syncAll backoff = 0.5^2 * 1000 = 250ms
+
+      const syncLatencyTracker = {
+        saveLatency: sinon.stub(),
+        saveTimestamp: sinon.stub(),
+        getLocusSyncLatency: sinon.stub(),
+        clearLocusSyncLatency: sinon.stub(),
+        completeLocusSyncLatency: sinon.stub(),
+      };
+      const parser = createHashTreeParser(
+        undefined,
+        undefined,
+        ['atd-unmuted'],
+        syncLatencyTracker
+      );
+      const mainUrl = parser.dataSets.main.url;
+
+      mockGetHashesFromLocusResponse(
+        mainUrl,
+        new Array(16).fill('00000000000000000000000000000000'),
+        createDataSet('main', 16, 1100)
+      );
+      mockSendSyncRequestResponse(mainUrl, null);
+
+      const syncAllPromise = parser.syncAllDatasets({onlyLLM: true});
+
+      await clock.tickAsync(250);
+      await syncAllPromise;
+
+      assert.calledWithExactly(
+        syncLatencyTracker.saveLatency,
+        'internal.client.locus.sync.random.backoff',
+        250,
+        {
+          meetingId: 'meeting-1',
+          dataSetName: 'main',
+        }
+      );
+    });
+
     it('should upgrade scope from onlyLLM=true to all datasets when onlyLLM=false call arrives during backoff', async () => {
       // Make Math.random return 1 so backoff = 1^2 * 1000 = 1000ms (non-zero delay for interleaving)
       mathRandomStub.returns(1);
@@ -5196,7 +5568,6 @@ describe('HashTreeParser', () => {
         ],
         visibleDataSetsUrl,
         locusUrl,
-        heartbeatIntervalMs: 5000,
         locusStateElements: [
           {
             htMeta: {
@@ -5220,5 +5591,291 @@ describe('HashTreeParser', () => {
       expect(parser.visibleDataSets).to.deep.equal([]);
       expect(parser.dataSets).to.deep.equal({});
     });
+  });
+
+  describe('#syncMetrics', () => {
+    it('records sync latency timestamps when sync response has empty body', async () => {
+      const syncLatencyTracker = {
+        saveLatency: sinon.stub(),
+        saveTimestamp: sinon.stub(),
+        getLocusSyncLatency: sinon.stub(),
+        clearLocusSyncLatency: sinon.stub(),
+        completeLocusSyncLatency: sinon.stub(),
+      };
+      const parser = createHashTreeParser(
+        undefined,
+        undefined,
+        undefined,
+        syncLatencyTracker
+      );
+      const mainDataSetUrl = parser.dataSets.main.url;
+
+      mockGetHashesFromLocusResponse(
+        mainDataSetUrl,
+        new Array(16).fill('00000000000000000000000000000000'),
+        createDataSet('main', 16, 1101)
+      );
+      mockSendSyncRequestResponse(mainDataSetUrl, null);
+
+      parser.handleMessage(
+        createHeartbeatMessage('main', 16, 1100, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1'),
+        'trigger sync metrics'
+      );
+
+      await clock.tickAsync(1000);
+
+      assert.calledWithExactly(syncLatencyTracker.saveTimestamp, {
+        key: 'internal.client.locus.sync.start',
+        options: {meetingId: 'meeting-1', dataSetName: 'main', trackingId: undefined},
+      });
+      assert.calledWithExactly(syncLatencyTracker.saveTimestamp, {
+        key: 'internal.client.locus.hashtree.request',
+        options: {meetingId: 'meeting-1', dataSetName: 'main', trackingId: undefined},
+      });
+      assert.calledWithExactly(syncLatencyTracker.saveTimestamp, {
+        key: 'internal.client.locus.hashtree.response',
+        options: {meetingId: 'meeting-1', dataSetName: 'main', trackingId: undefined},
+      });
+      assert.calledWithExactly(syncLatencyTracker.saveTimestamp, {
+        key: 'internal.client.locus.sync.request',
+        options: {meetingId: 'meeting-1', dataSetName: 'main', trackingId: undefined},
+      });
+      assert.calledWithExactly(syncLatencyTracker.saveTimestamp, {
+        key: 'internal.client.locus.sync.response',
+        options: {meetingId: 'meeting-1', dataSetName: 'main', trackingId: undefined},
+      });
+      assert.notCalled(syncLatencyTracker.getLocusSyncLatency);
+    });
+
+    it('clears only the failed sync record (by tracking id) when the /sync request errors', async () => {
+      const syncLatencyTracker = {
+        saveLatency: sinon.stub(),
+        saveTimestamp: sinon.stub(),
+        getLocusSyncLatency: sinon.stub(),
+        clearLocusSyncLatency: sinon.stub(),
+        completeLocusSyncLatency: sinon.stub(),
+      };
+      const generateTrackingId = sinon.stub().returns('our-sync-tracking-id');
+      const parser = createHashTreeParser(
+        undefined,
+        undefined,
+        undefined,
+        syncLatencyTracker,
+        undefined,
+        generateTrackingId
+      );
+      const mainDataSetUrl = parser.dataSets.main.url;
+
+      // Mismatched hashes so the flow proceeds to POST /sync, which then fails.
+      mockGetHashesFromLocusResponse(
+        mainDataSetUrl,
+        new Array(16).fill('00000000000000000000000000000000'),
+        createDataSet('main', 16, 1101)
+      );
+      webexRequest
+        .withArgs(sinon.match({method: 'POST', uri: `${mainDataSetUrl}/sync`}))
+        .rejects(new Error('sync failed'));
+
+      parser.handleMessage(
+        createHeartbeatMessage('main', 16, 1100, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1'),
+        'trigger sync metrics'
+      );
+
+      await clock.tickAsync(1000);
+
+      // Because /sync failed, syncRequestSent stays false and the finally block drops the record,
+      // passing the tracking id so only this in-progress record is removed (native onSyncError parity).
+      assert.calledWithExactly(
+        syncLatencyTracker.clearLocusSyncLatency,
+        'main',
+        'meeting-1',
+        'our-sync-tracking-id'
+      );
+    });
+
+    it('forces a pre-generated tracking id onto the sync request and records it', async () => {
+      const syncLatencyTracker = {
+        saveLatency: sinon.stub(),
+        saveTimestamp: sinon.stub(),
+        getLocusSyncLatency: sinon.stub(),
+        clearLocusSyncLatency: sinon.stub(),
+        completeLocusSyncLatency: sinon.stub(),
+      };
+      // two distinct tracking ids are generated: the first for the /hashtree request and the
+      // second for the /sync request (which is also stored in metrics and used for LLM matching)
+      const generateTrackingId = sinon.stub();
+      generateTrackingId.onFirstCall().returns('our-hashtree-tracking-id');
+      generateTrackingId.onSecondCall().returns('our-sync-tracking-id');
+      const parser = createHashTreeParser(
+        undefined,
+        undefined,
+        undefined,
+        syncLatencyTracker,
+        undefined,
+        generateTrackingId
+      );
+      const mainDataSetUrl = parser.dataSets.main.url;
+
+      mockGetHashesFromLocusResponse(
+        mainDataSetUrl,
+        new Array(16).fill('00000000000000000000000000000000'),
+        createDataSet('main', 16, 1102)
+      );
+      mockSendSyncRequestResponse(mainDataSetUrl, null);
+
+      parser.handleMessage(
+        createHeartbeatMessage('main', 16, 1100, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1'),
+        'trigger sync metrics'
+      );
+
+      await clock.tickAsync(1000);
+
+      // two distinct tracking ids are generated up-front so the /hashtree and /sync requests do
+      // not share a tracking id
+      assert.calledTwice(generateTrackingId);
+      // the /hashtree request carries its own (first) tracking id
+      assert.calledWith(
+        webexRequest,
+        sinon.match({
+          method: 'GET',
+          uri: `${mainDataSetUrl}/hashtree`,
+          headers: {trackingid: 'our-hashtree-tracking-id'},
+        })
+      );
+      // the /sync request carries the second tracking id, which Locus echoes back on the resulting
+      // LLM message so the Meeting object can match it to this sync
+      assert.calledWith(
+        webexRequest,
+        sinon.match({
+          method: 'POST',
+          uri: `${mainDataSetUrl}/sync`,
+          headers: {trackingid: 'our-sync-tracking-id'},
+        })
+      );
+
+      // the same tracking id is stamped on the sync milestones so the Meeting object can later
+      // match the LLM event to this sync
+      assert.calledWithExactly(syncLatencyTracker.saveTimestamp, {
+        key: 'internal.client.locus.sync.start',
+        options: {meetingId: 'meeting-1', dataSetName: 'main', trackingId: 'our-sync-tracking-id'},
+      });
+      assert.calledWithExactly(syncLatencyTracker.saveTimestamp, {
+        key: 'internal.client.locus.hashtree.request',
+        options: {meetingId: 'meeting-1', dataSetName: 'main', trackingId: 'our-sync-tracking-id'},
+      });
+      assert.calledWithExactly(syncLatencyTracker.saveTimestamp, {
+        key: 'internal.client.locus.hashtree.response',
+        options: {meetingId: 'meeting-1', dataSetName: 'main', trackingId: 'our-sync-tracking-id'},
+      });
+      assert.calledWithExactly(syncLatencyTracker.saveTimestamp, {
+        key: 'internal.client.locus.sync.request',
+        options: {meetingId: 'meeting-1', dataSetName: 'main', trackingId: 'our-sync-tracking-id'},
+      });
+      assert.calledWithExactly(syncLatencyTracker.saveTimestamp, {
+        key: 'internal.client.locus.sync.response',
+        options: {meetingId: 'meeting-1', dataSetName: 'main', trackingId: 'our-sync-tracking-id'},
+      });
+      assert.notCalled(syncLatencyTracker.getLocusSyncLatency);
+    });
+
+    it('does not complete or clear metrics when matching dataset message arrives', () => {
+      const syncLatencyTracker = {
+        saveLatency: sinon.stub(),
+        saveTimestamp: sinon.stub(),
+        getLocusSyncLatency: sinon.stub(),
+        clearLocusSyncLatency: sinon.stub(),
+        completeLocusSyncLatency: sinon.stub(),
+      };
+      const parser = createHashTreeParser(
+        undefined,
+        undefined,
+        undefined,
+        syncLatencyTracker
+      );
+
+      parser.handleMessage({
+        dataSets: [
+          {
+            ...createDataSet('main', 16, 1001),
+            root: 'newroot',
+          },
+        ],
+        visibleDataSetsUrl,
+        locusUrl,
+        locusStateElements: [],
+      });
+
+      assert.notCalled(syncLatencyTracker.getLocusSyncLatency);
+      assert.notCalled(syncLatencyTracker.clearLocusSyncLatency);
+      assert.notCalled(syncLatencyTracker.completeLocusSyncLatency);
+    });
+
+    it('does not complete sync metrics when sync response has body (completion is LLM-only)', async () => {
+      const syncLatencyTracker = {
+        saveLatency: sinon.stub(),
+        saveTimestamp: sinon.stub(),
+        getLocusSyncLatency: sinon.stub(),
+        clearLocusSyncLatency: sinon.stub(),
+        completeLocusSyncLatency: sinon.stub(),
+      };
+      const generateTrackingId = sinon.stub().returns('our-sync-tracking-id');
+      const parser = createHashTreeParser(
+        undefined,
+        undefined,
+        undefined,
+        syncLatencyTracker,
+        undefined,
+        generateTrackingId
+      );
+      const mainDataSetUrl = parser.dataSets.main.url;
+      const syncResponse = {
+        dataSets: [
+          {
+            ...createDataSet('main', 16, 1102),
+            root: 'newroot',
+          },
+        ],
+        visibleDataSetsUrl,
+        locusUrl,
+        locusStateElements: [],
+      };
+
+      mockGetHashesFromLocusResponse(
+        mainDataSetUrl,
+        new Array(16).fill('00000000000000000000000000000000'),
+        createDataSet('main', 16, 1102)
+      );
+      mockSendSyncRequestResponse(mainDataSetUrl, syncResponse);
+
+      parser.handleMessage(
+        createHeartbeatMessage('main', 16, 1100, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1'),
+        'trigger sync metrics'
+      );
+
+      await clock.tickAsync(1000);
+
+      assert.calledWithExactly(syncLatencyTracker.saveTimestamp, {
+        key: 'internal.client.locus.sync.response',
+        options: {
+          meetingId: 'meeting-1',
+          dataSetName: 'main',
+          trackingId: 'our-sync-tracking-id',
+        },
+      });
+      // body-mode syncs return the state elements in the /sync HTTP response, but per the LLM-only
+      // design the CA metric is completed solely from Meeting#processLocusLLMEvent once the matching
+      // LLM message arrives. handleMessage must not record the message-received milestone nor
+      // complete the metric here.
+      assert.neverCalledWith(syncLatencyTracker.saveTimestamp, {
+        key: 'internal.client.locus.sync.message.received',
+        options: {
+          meetingId: 'meeting-1',
+          dataSetName: 'main',
+          trackingId: 'our-sync-tracking-id',
+        },
+      });
+      assert.notCalled(syncLatencyTracker.completeLocusSyncLatency);
+    });
+
   });
 });

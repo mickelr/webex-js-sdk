@@ -3,6 +3,7 @@ import sinon from 'sinon';
 import {cloneDeep, forEach} from 'lodash';
 import {assert} from '@webex/test-helper-chai';
 import MockWebex from '@webex/test-helper-mock-webex';
+import {webexTrackingIdSequenceNumbers} from '@webex/webex-core';
 import testUtils from '../../../utils/testUtils';
 import Meetings from '@webex/plugin-meetings';
 import LocusInfo, {createLocusFromHashTreeMessage, findMeetingForHashTreeMessage} from '@webex/plugin-meetings/src/locus-info';
@@ -31,6 +32,7 @@ import {
 
 import {self, selfWithInactivity} from './selfConstant';
 import {MEETING_REMOVED_REASON} from '@webex/plugin-meetings/src/constants';
+import BEHAVIORAL_METRICS from '@webex/plugin-meetings/src/metrics/constants';
 import LoggerProxy from '@webex/plugin-meetings/src/common/logs/logger-proxy';
 
 describe('plugin-meetings', () => {
@@ -56,7 +58,7 @@ describe('plugin-meetings', () => {
 
     beforeEach(() => {
       mockMeeting = {};
-      locusInfo = new LocusInfo(updateMeeting, webex, meetingId);
+      locusInfo = new LocusInfo({updateMeeting}, webex, meetingId);
 
       locusInfo.init(locus);
 
@@ -148,7 +150,9 @@ describe('plugin-meetings', () => {
               visibleDataSets,
             },
             webexRequest: sinon.match.func,
-            locusInfoUpdateCallback: sinon.match.func,
+            callbacks: sinon.match({
+              locusInfoUpdateCallback: sinon.match.func,
+            }),
             debugId: sinon.match.string,
           })
         );
@@ -156,6 +160,39 @@ describe('plugin-meetings', () => {
         assert.notCalled(updateLocusCacheStub);
         assert.notCalled(updateLocusInfoStub);
         assert.isTrue(locusInfo.emitChange);
+      });
+
+      it('passes a generateTrackingId callback that reuses the tracking-id interceptor sequence', async () => {
+        webex.sessionId = 'test-session';
+        const hashTreeMessage = createHashTreeMessage(['dataset1']);
+
+        await locusInfo.initialSetup({trigger: 'locus-message', hashTreeMessage});
+
+        const {generateTrackingId} = HashTreeParserStub.firstCall.args[0].callbacks;
+
+        // The interceptor for this webex is present in the exposed map -> reuse its sequence.
+        const fakeInterceptor = {webex, sequence: 7};
+        webexTrackingIdSequenceNumbers.set(fakeInterceptor, 0);
+
+        try {
+          assert.equal(generateTrackingId(), 'test-session_7');
+        } finally {
+          webexTrackingIdSequenceNumbers.delete(fakeInterceptor);
+        }
+      });
+
+      it('passes a generateTrackingId callback that falls back to a uuid when no interceptor is registered', async () => {
+        webex.sessionId = 'test-session';
+        const hashTreeMessage = createHashTreeMessage(['dataset1']);
+
+        await locusInfo.initialSetup({trigger: 'locus-message', hashTreeMessage});
+
+        const {generateTrackingId} = HashTreeParserStub.firstCall.args[0].callbacks;
+
+        assert.match(
+          generateTrackingId(),
+          /^test-session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+        );
       });
 
       it('should not initialize the hash tree when triggered from a non-hash tree locus message', async () => {
@@ -198,7 +235,9 @@ describe('plugin-meetings', () => {
             },
             metadata,
             webexRequest: sinon.match.func,
-            locusInfoUpdateCallback: sinon.match.func,
+            callbacks: sinon.match({
+              locusInfoUpdateCallback: sinon.match.func,
+            }),
             debugId: sinon.match.string,
           })
         );
@@ -279,7 +318,9 @@ describe('plugin-meetings', () => {
               dataSets: [],
             },
             webexRequest: sinon.match.func,
-            locusInfoUpdateCallback: sinon.match.func,
+            callbacks: sinon.match({
+              locusInfoUpdateCallback: sinon.match.func,
+            }),
             debugId: sinon.match.string,
             metadata: null,
           })
@@ -355,7 +396,7 @@ describe('plugin-meetings', () => {
             },
           });
 
-          locusInfoUpdateCallback = HashTreeParserStub.firstCall.args[0].locusInfoUpdateCallback;
+          locusInfoUpdateCallback = HashTreeParserStub.firstCall.args[0].callbacks.locusInfoUpdateCallback;
 
           assert.isDefined(locusInfoUpdateCallback);
 
@@ -2846,6 +2887,10 @@ describe('plugin-meetings', () => {
 
         let expectedMeeting;
 
+        // simulate that updateSelf has been called previously (as happens in production)
+        // so that parsedLocus.self reflects the joined state
+        locusInfo.parsedLocus.self = {state: 'JOINED'};
+
         /*
         When the event is triggered, it is required that the meeting has already
         been updated. This is why the meeting is being checked within the stubbed event emitter
@@ -2856,6 +2901,7 @@ describe('plugin-meetings', () => {
 
         // set the info initially as locusInfo.info starts as undefined
         expectedMeeting = {
+          attendee: {},
           coHost: {
             LOWER_SOMEONE_ELSES_HAND: true,
           },
@@ -2864,10 +2910,12 @@ describe('plugin-meetings', () => {
           moderator: {
             LOWER_SOMEONE_ELSES_HAND: true,
           },
+          panelist: {},
           policy: {
             LOCK_STATUS_UNLOCKED: true,
             ROSTER_IN_MEETING: true,
           },
+          presenter: {},
           userDisplayHints: ['ROSTER_IN_MEETING', 'LOCK_STATUS_UNLOCKED'],
         };
         locusInfo.updateMeetingInfo(initialInfo, self);
@@ -2882,6 +2930,7 @@ describe('plugin-meetings', () => {
 
         // Updating with different info should trigger the event
         expectedMeeting = {
+          attendee: {},
           coHost: {
             LOWER_SOMEONE_ELSES_HAND: true,
             LOCK_CONTROL_LOCK: true,
@@ -2891,10 +2940,12 @@ describe('plugin-meetings', () => {
           moderator: {
             LOWER_SOMEONE_ELSES_HAND: true,
           },
+          panelist: {},
           policy: {
             LOCK_STATUS_UNLOCKED: true,
             ROSTER_IN_MEETING: true,
           },
+          presenter: {},
           userDisplayHints: ['ROSTER_IN_MEETING', 'LOCK_STATUS_UNLOCKED'],
         };
         locusInfo.updateMeetingInfo(newInfo, self);
@@ -2903,6 +2954,7 @@ describe('plugin-meetings', () => {
 
         // update it with the same info
         expectedMeeting = {
+          attendee: {},
           coHost: {
             LOWER_SOMEONE_ELSES_HAND: true,
             LOCK_CONTROL_LOCK: true,
@@ -2912,10 +2964,12 @@ describe('plugin-meetings', () => {
           moderator: {
             LOWER_SOMEONE_ELSES_HAND: true,
           },
+          panelist: {},
           policy: {
             LOCK_STATUS_UNLOCKED: true,
             ROSTER_IN_MEETING: true,
           },
+          presenter: {},
           userDisplayHints: ['ROSTER_IN_MEETING', 'LOCK_STATUS_UNLOCKED'],
         };
         locusInfo.updateMeetingInfo(newInfo, self);
@@ -2930,6 +2984,7 @@ describe('plugin-meetings', () => {
           hasRole: true,
         });
         expectedMeeting = {
+          attendee: {},
           coHost: {
             LOWER_SOMEONE_ELSES_HAND: true,
             LOCK_CONTROL_LOCK: true,
@@ -2939,10 +2994,12 @@ describe('plugin-meetings', () => {
           moderator: {
             LOWER_SOMEONE_ELSES_HAND: true,
           },
+          panelist: {},
           policy: {
             LOCK_STATUS_UNLOCKED: true,
             ROSTER_IN_MEETING: true,
           },
+          presenter: {},
           userDisplayHints: [
             'ROSTER_IN_MEETING',
             'LOCK_STATUS_UNLOCKED',
@@ -2984,6 +3041,46 @@ describe('plugin-meetings', () => {
 
         // since self is not passed to updateMeetingInfo, MEETING_INFO_UPDATED should be triggered with isIntializing: true
         checkMeetingInfoUpdatedCalledForRoles(true, {isInitializing: true});
+      });
+
+      // joined-section hints (like ROSTER_IN_MEETING) are filtered out while not joined, so they
+      // are a good proxy for verifying that userDisplayHints get recomputed on a join transition
+      [
+        {
+          name: 'the JOINED delta carries the info section',
+          getSecondInfo: (info) => info,
+        },
+        {
+          name: 'the JOINED delta omits the info section (falls back to stored info)',
+          getSecondInfo: () => undefined,
+        },
+      ].forEach(({name, getSecondInfo}) => {
+        it(`recomputes userDisplayHints when self transitions to JOINED with unchanged roles and ${name}`, () => {
+          const info = cloneDeep(meetingInfo); // joined: ['ROSTER_IN_MEETING', 'LOCK_STATUS_UNLOCKED']
+
+          const notJoinedSelf = cloneDeep(self);
+          notJoinedSelf.state = 'IDLE';
+          notJoinedSelf.controls.role.roles = [];
+
+          const joinedSelf = cloneDeep(self);
+          joinedSelf.state = 'JOINED';
+          joinedSelf.controls.role.roles = [];
+
+          sinon.stub(locusInfo, 'emitScoped');
+
+          // first update while not joined: joined-section hints are filtered out
+          locusInfo.updateMeetingInfo(info, notJoinedSelf);
+          assert.notInclude(locusInfo.parsedLocus.info.userDisplayHints, 'ROSTER_IN_MEETING');
+          assert.notInclude(locusInfo.parsedLocus.info.userDisplayHints, 'LOCK_STATUS_UNLOCKED');
+
+          // self transitions to JOINED - info and roles are unchanged
+          locusInfo.updateMeetingInfo(getSecondInfo(info), joinedSelf);
+
+          // the hints must be recomputed with the new joined state
+          assert.include(locusInfo.parsedLocus.info.userDisplayHints, 'ROSTER_IN_MEETING');
+          assert.include(locusInfo.parsedLocus.info.userDisplayHints, 'LOCK_STATUS_UNLOCKED');
+          checkMeetingInfoUpdatedCalled(true, {isInitializing: false});
+        });
       });
     });
 
@@ -4831,6 +4928,11 @@ describe('plugin-meetings', () => {
               options: {
                 meetingId: locusInfo.meetingId,
               },
+              payload: {
+                eventData: {
+                  joinInProgress: false,
+                },
+              },
             });
           });
 
@@ -4850,6 +4952,11 @@ describe('plugin-meetings', () => {
               name: 'client.call.remote-ended',
               options: {
                 meetingId: locusInfo.meetingId,
+              },
+              payload: {
+                eventData: {
+                  joinInProgress: false,
+                },
               },
             });
           });
@@ -4871,6 +4978,11 @@ describe('plugin-meetings', () => {
               name: 'client.call.remote-ended',
               options: {
                 meetingId: locusInfo.meetingId,
+              },
+              payload: {
+                eventData: {
+                  joinInProgress: false,
+                },
               },
             });
           });
@@ -4943,6 +5055,93 @@ describe('plugin-meetings', () => {
             shouldLeave: false,
           }
         );
+      });
+
+      describe('destroyMeetingSuspended', () => {
+        it('suppresses DESTROY_MEETING for SELF_REMOVED when suspended', () => {
+          locusInfo.emitScoped = sinon.stub();
+          locusInfo.suspendDestroyMeeting(true);
+          locusInfo.parsedLocus = {
+            fullState: {
+              type: _MEETING_,
+            },
+            self: {
+              removed: true,
+            }
+          };
+
+          locusInfo.isMeetingActive();
+
+          assert.notCalled(locusInfo.emitScoped);
+          assert.calledOnceWithExactly(
+            sendBehavioralMetricStub,
+            BEHAVIORAL_METRICS.DESTROY_MEETING_WHILE_SUSPENDED,
+            {
+              meetingId: locusInfo.meetingId,
+              reason: 'SELF_REMOVED',
+            }
+          );
+        });
+
+        it('suppresses DESTROY_MEETING for MEETING_INACTIVE_TERMINATING when suspended', () => {
+          locusInfo.emitScoped = sinon.stub();
+          locusInfo.suspendDestroyMeeting(true);
+          locusInfo.parsedLocus = {
+            fullState: {
+              type: _MEETING_,
+            },
+          };
+          locusInfo.fullState = {
+            state: LOCUS.STATE.INACTIVE,
+          };
+
+          locusInfo.isMeetingActive();
+
+          assert.notCalled(locusInfo.emitScoped);
+          assert.notCalled(webex.internal.newMetrics.submitClientEvent);
+          assert.calledOnceWithExactly(
+            sendBehavioralMetricStub,
+            BEHAVIORAL_METRICS.DESTROY_MEETING_WHILE_SUSPENDED,
+            {
+              meetingId: locusInfo.meetingId,
+              reason: 'MEETING_INACTIVE_TERMINATING',
+            }
+          );
+        });
+
+        [
+          {reason: 'CALL_INACTIVE', setup: () => {
+            locusInfo.parsedLocus = {fullState: {type: _CALL_}};
+            locusInfo.fullState = {state: LOCUS.STATE.INACTIVE};
+          }},
+          {reason: 'PARTNER_LEFT', setup: () => {
+            locusInfo.getLocusPartner = sinon.stub().returns({state: MEETING_STATE.STATES.LEFT});
+            locusInfo.parsedLocus = {fullState: {type: _CALL_}, self: {state: MEETING_STATE.STATES.JOINED}};
+          }},
+          {reason: 'SELF_LEFT', setup: () => {
+            locusInfo.getLocusPartner = sinon.stub().returns({state: MEETING_STATE.STATES.LEFT});
+            locusInfo.parsedLocus = {fullState: {type: _CALL_}, self: {state: MEETING_STATE.STATES.LEFT}};
+          }},
+        ].forEach(({reason, setup}) => {
+          it(`sends joinInProgress=true in client event for ${reason} when suspended`, () => {
+            locusInfo.suspendDestroyMeeting(true);
+            setup();
+
+            locusInfo.isMeetingActive();
+
+            assert.calledWith(webex.internal.newMetrics.submitClientEvent, {
+              name: 'client.call.remote-ended',
+              options: {
+                meetingId: locusInfo.meetingId,
+              },
+              payload: {
+                eventData: {
+                  joinInProgress: true,
+                },
+              },
+            });
+          });
+        });
       });
     });
 
